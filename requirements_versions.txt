@@ -1,0 +1,48 @@
+# ============================================================
+# Pinned package versions for diffusion-based image editing
+# literature survey (MasaCtrl, PnP, DragonDiffusion).
+# ============================================================
+#
+# These older repos are very sensitive to the diffusers /
+# transformers / huggingface_hub triad. The versions below are
+# the ones that actually load Stable Diffusion v1.4/v1.5 weights
+# and run the custom attention hooks used by MasaCtrl and PnP.
+# If you bump them, the custom UNet attention processors break
+# because their API changed in diffusers >= 0.24.
+# ============================================================
+
+# ---- Base stack (shared by MasaCtrl + PnP) -------------------
+diffusers==0.21.4          # required: custom attention processors
+                           # (AttnProcessor2_0) and UNet2DConditionModel
+                           # kwargs used by MasaCtrl/PnP assume this API.
+huggingface_hub==0.25.2    # pinned: newer hub removes cached_download,
+                           # which older diffusers imports at load time.
+transformers==4.34.1       # pinned: CLIPTextModel signature matches the
+                           # diffusers 0.21.x pipeline expectations.
+accelerate==0.24.1         # required by diffusers 0.21.x loaders.
+safetensors==0.4.1         # weight format used by SD 1.4/1.5 checkpoints.
+tokenizers==0.14.1         # matches transformers 4.34.x.
+numpy==1.26.4              # diffusers 0.21.x + torch 2.1 combo is stable
+                           # here. numpy 2.x breaks einops+torch on Colab.
+einops==0.7.0              # used by MasaCtrl's attention rearranges.
+omegaconf==2.3.0           # used by PnP config loading.
+opencv-python==4.8.1.78    # image IO for DragonDiffusion.
+matplotlib==3.8.2          # side-by-side visualization.
+Pillow==10.2.0             # stable PIL for diffusers pipelines.
+ftfy==6.1.3                # CLIP tokenizer text fixup.
+regex==2023.12.25          # CLIP tokenizer regex backend.
+
+# ---- DragonDiffusion specifics -------------------------------
+# DragonDiffusion pulls in its own requirements.txt from the
+# official repo (MC-E/DragonDiffusion). The two packages below
+# are the only ones that are not already covered above and that
+# we have observed to cause version conflicts on Colab T4.
+gradio==3.50.2             # DragonDiffusion's demo imports gradio;
+                           # pin to avoid pulling gradio 4.x which
+                           # breaks the component API.
+basicsr==1.4.2             # used by DragonDiffusion's SD backbone utils.
+
+# ---- Torch (install separately, already present on Colab) ----
+# Do NOT pip-install torch inside Colab; Colab ships with a CUDA
+# build that matches the runtime. Reinstalling will break CUDA.
+# Expected on Colab T4: torch==2.1.x, torchvision==0.16.x.
