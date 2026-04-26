@@ -22,8 +22,9 @@ transformers==4.34.1       # pinned: CLIPTextModel signature matches the
 accelerate==0.24.1         # required by diffusers 0.21.x loaders.
 safetensors==0.4.1         # weight format used by SD 1.4/1.5 checkpoints.
 tokenizers==0.14.1         # matches transformers 4.34.x.
-numpy==1.26.4              # diffusers 0.21.x + torch 2.1 combo is stable
-                           # here. numpy 2.x breaks einops+torch on Colab.
+# numpy: do NOT pin. Colab\'s preinstalled torch is built against numpy 2.x.
+# Forcing numpy 1.x produces "numpy.dtype size changed (96 vs 88)" ABI
+# errors when basicsr (DragonDiffusion dep) loads.
 einops==0.7.0              # used by MasaCtrl's attention rearranges.
 omegaconf==2.3.0           # used by PnP config loading.
 opencv-python==4.8.1.78    # image IO for DragonDiffusion.

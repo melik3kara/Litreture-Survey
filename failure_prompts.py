@@ -26,8 +26,9 @@ MASACTRL_EXPERIMENTS = [
     {
         "id": "masactrl_three_eyes",
         "failure_type": "unnatural_prompt",
-        "source_prompt": "a photo of a young woman standing, studio light",
-        "target_prompt": "a photo of a young woman with three eyes standing, studio light",
+        "source_image_key": "portrait",
+        "source_prompt": "a portrait of a person",
+        "target_prompt": "a portrait of a person with three eyes on the face",
         "hypothesis": (
             "Mutual self-attention reuses the source's facial feature layout, "
             "so the model is expected to either drop the third eye entirely "
@@ -39,20 +40,22 @@ MASACTRL_EXPERIMENTS = [
     {
         "id": "masactrl_floating_car",
         "failure_type": "unnatural_prompt",
-        "source_prompt": "a red car parked on a city street, daytime",
-        "target_prompt": "a red car floating above the buildings, daytime",
+        "source_image_key": "street",
+        "source_prompt": "a busy city street with cars",
+        "target_prompt": "a busy city street with cars floating above the buildings",
         "hypothesis": (
-            "Structure-preserving attention anchors the car to the ground plane "
+            "Structure-preserving attention anchors the cars to the ground plane "
             "of the source; the target's aerial position should collide with "
-            "the preserved road layout and produce a stretched or ghosted car."
+            "the preserved road layout and produce stretched or ghosted cars."
         ),
         "seed": 7,
     },
     {
         "id": "masactrl_hair_and_glasses",
         "failure_type": "attribute_conflict",
-        "source_prompt": "a portrait of a man with short brown hair, neutral background",
-        "target_prompt": "a portrait of a man with long blonde hair wearing round glasses, neutral background",
+        "source_image_key": "portrait",
+        "source_prompt": "a portrait of a person",
+        "target_prompt": "a portrait of a person with long blonde hair wearing round glasses",
         "hypothesis": (
             "Two simultaneous edits (hair length+color AND glasses) compete for "
             "the same self-attention map; we expect partial success on one "
@@ -64,12 +67,14 @@ MASACTRL_EXPERIMENTS = [
     {
         "id": "masactrl_crowded_pose",
         "failure_type": "spatial_complex",
-        "source_prompt": "a man standing in a crowded street market, many people around",
-        "target_prompt": "a man jumping in a crowded street market, many people around",
+        "source_image_key": "street",
+        "source_prompt": "a crowded city street with people walking",
+        "target_prompt": "a crowded city street where a person is jumping in the middle",
         "hypothesis": (
-            "The 'many people' background creates distracting self-attention "
-            "targets. MasaCtrl is expected to leak the jumping pose into "
-            "neighboring people or fail to change the subject's pose at all."
+            "Distractors in the crowded background create spurious self-attention "
+            "matches. MasaCtrl is expected to leak the jumping pose into "
+            "neighboring people or fail to change pose at all while preserving "
+            "background identity."
         ),
         "seed": 2024,
     },

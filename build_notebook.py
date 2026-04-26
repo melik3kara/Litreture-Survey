@@ -83,7 +83,9 @@ BASE_PACKAGES = [
     "Pillow==10.2.0",
     "ftfy==6.1.3",
     "regex==2023.12.25",
-    "numpy==1.26.4",
+    # Do NOT pin numpy. Colab\'s preinstalled torch is built against numpy 2.x
+    # and pinning 1.x triggers "numpy.dtype size changed (96 vs 88)" ABI
+    # errors when downstream C-extensions (e.g. basicsr) load.
 ]
 
 def pip_install(pkgs, extra_flags=()):
@@ -209,7 +211,9 @@ class Timer:
 # ---------------------------------------------------------------- MasaCtrl
 md("""## 5. MasaCtrl (ICCV 2023) — Mutual Self-Attention Control
 
-**Idea.** During denoising of an edited prompt, replace the *self-attention keys and values* in certain UNet layers/steps with those computed from the source prompt's denoising trajectory. This preserves the subject's appearance while allowing the text prompt to change non-rigid structure (pose, action).
+**Idea.** During denoising of an edited prompt, replace the *self-attention keys and values* in certain UNet layers/steps with those computed from the source's denoising trajectory. This preserves the subject's appearance while allowing the text prompt to change non-rigid structure (pose, action).
+
+**Mode used here: real-image editing.** We DDIM-invert the user-supplied source image (one of the test images) with `pipe.invert(...)` and use the resulting latent as the starting point. The source prompt describes the input; the target prompt specifies the edit. This is the mode required by the assignment, which expects edits performed on real input images, not text-only synthesis.
 
 **Why we expect failures on our inputs.**
 - *Unnatural prompts*: mutual-attention pins the source's facial/object topology, so injected anatomical changes (e.g. *three eyes*) collide with preserved structure.
@@ -226,20 +230,47 @@ if not MASACTRL_DIR.exists():
         check=False,
     )
 print("MasaCtrl at:", MASACTRL_DIR, "exists:", MASACTRL_DIR.exists())
+
+# MasaCtrl's diffuser_utils.py imports pytorch_lightning for seed_everything.
+pip_install(["pytorch_lightning==2.1.3"])
+
 if str(MASACTRL_DIR) not in sys.path:
     sys.path.insert(0, str(MASACTRL_DIR))
 ''')
 
-code('''# MasaCtrl inference: consistent-synthesis mode.
-# The source and target prompt are denoised in parallel; the target uses
-# MutualSelfAttentionControl to reuse the source's K/V after step START_STEP
-# in layers >= START_LAYER.
+code('''# MasaCtrl inference: REAL-IMAGE editing mode.
+# Pipeline:
+#   (1) DDIM-invert the user-supplied source image using the source prompt.
+#   (2) Replay denoising in a 2-batch [source, target]; for the target branch
+#       inject the source\'s self-attention K/V at step >= START_STEP, layer
+#       >= START_LAYER (MutualSelfAttentionControl).
+# This is the mode used by playground_real.ipynb in the official repo and is
+# the appropriate mode when the assignment specifies "your own input images".
 try:
     with Timer("MasaCtrl total") as timer:
+        import numpy as np
+        import diffusers as _df
+        print("diffusers version:", _df.__version__)
+        if not _df.__version__.startswith("0.21."):
+            print("WARNING: MasaCtrl attention hooks were written against "
+                  "diffusers 0.21.x. Newer versions may silently no-op.")
         from diffusers import DDIMScheduler
         from masactrl.diffuser_utils import MasaCtrlPipeline
-        from masactrl.masactrl_utils import regiter_attention_editor_diffusers
+        from masactrl.masactrl_utils import (
+            regiter_attention_editor_diffusers, AttentionBase,
+        )
         from masactrl.masactrl import MutualSelfAttentionControl
+
+        # Self-heal: if the test-images cell was not run in this session,
+        # rebuild TEST_IMAGES from whatever is on disk under TEST_DIR.
+        if "TEST_IMAGES" not in dir() and "TEST_IMAGES" not in globals():
+            TEST_IMAGES = {p.stem: p for p in TEST_DIR.glob("*.jpg")}
+        for required in ("portrait", "street", "indoor"):
+            if required not in TEST_IMAGES or not Path(TEST_IMAGES[required]).exists():
+                raise RuntimeError(
+                    f"Missing test image \'{required}\'. Run the Test Images cell "
+                    f"(section 2) first, or drop a {required}.jpg into {TEST_DIR}."
+                )
 
         MODEL_ID = "CompVis/stable-diffusion-v1-4"
         scheduler = DDIMScheduler(
@@ -254,46 +285,53 @@ try:
 
         out_dir = RESULTS_DIR / "masactrl"
 
+        def _load_for_invert(path, size=512):
+            pil = Image.open(path).convert("RGB").resize((size, size), Image.LANCZOS)
+            arr = np.array(pil).astype(np.float32) / 127.5 - 1.0   # [-1, 1]
+            t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+            return pil, t.to(DEVICE, dtype=pipe.unet.dtype)
+
+        def _to_pil(t):
+            arr = (t.detach().float().cpu().clamp(0, 1).numpy() * 255).astype("uint8")
+            if arr.ndim == 3 and arr.shape[0] in (1, 3):
+                arr = arr.transpose(1, 2, 0)
+            return Image.fromarray(arr)
+
         for exp in MASACTRL_EXPERIMENTS:
             try:
                 torch.manual_seed(exp["seed"])
-                prompts = [exp["source_prompt"], exp["target_prompt"]]
-                start_code = torch.randn(
-                    [1, 4, 64, 64], device=DEVICE,
-                    dtype=pipe.unet.dtype,
-                ).expand(2, -1, -1, -1)
+                src_path = TEST_IMAGES[exp["source_image_key"]]
+                pil_src, src_tensor = _load_for_invert(src_path)
 
-                # 1) Source-only generation for reference.
-                from masactrl.masactrl_utils import AttentionBase
+                # (1) DDIM inversion of the real image -> initial latent.
+                # IMPORTANT: guidance_scale=1.0 (no CFG) for inversion. Using
+                # CFG here causes inversion to drift; outputs then look
+                # unrelated to the source. This matches playground_real.ipynb.
                 regiter_attention_editor_diffusers(pipe, AttentionBase())
-                imgs_src = pipe(prompts, latents=start_code,
-                                guidance_scale=7.5,
-                                num_inference_steps=40)
-                src_img = imgs_src[0]
+                start_code, _ = pipe.invert(
+                    src_tensor,
+                    exp["source_prompt"],
+                    guidance_scale=1.0,
+                    num_inference_steps=50,
+                    return_intermediates=True,
+                )
+                start_code = start_code.expand(2, -1, -1, -1)
 
-                # 2) Edited generation with MutualSelfAttentionControl.
+                # (2) Editing with mutual self-attention control.
                 editor = MutualSelfAttentionControl(start_step=4, start_layer=10)
                 regiter_attention_editor_diffusers(pipe, editor)
-                imgs_edit = pipe(prompts, latents=start_code,
-                                 guidance_scale=7.5,
-                                 num_inference_steps=40)
-                edit_img = imgs_edit[-1]
+                prompts = [exp["source_prompt"], exp["target_prompt"]]
+                imgs = pipe(prompts, latents=start_code,
+                            guidance_scale=7.5, num_inference_steps=50)
+                edit_img = imgs[-1]
 
-                # Convert tensor images to PIL.
-                def _to_pil(t):
-                    import numpy as np
-                    arr = (t.detach().float().cpu().clamp(0, 1).numpy() * 255).astype("uint8")
-                    if arr.ndim == 3 and arr.shape[0] in (1, 3):
-                        arr = arr.transpose(1, 2, 0)
-                    return Image.fromarray(arr)
-
-                save_image(_to_pil(src_img),  out_dir / f"{exp['id']}_input.png")
-                save_image(_to_pil(edit_img), out_dir / f"{exp['id']}_output.png")
+                save_image(pil_src,           out_dir / f"{exp[\'id\']}_input.png")
+                save_image(_to_pil(edit_img), out_dir / f"{exp[\'id\']}_output.png")
                 STATUS["masactrl"][exp["id"]] = "ok"
-                print(f"  [ok]   {exp['id']}")
+                print(f"  [ok]   {exp[\'id\']}")
             except Exception as ex:
                 STATUS["masactrl"][exp["id"]] = f"error: {ex}"
-                print(f"  [fail] {exp['id']}: {ex}")
+                print(f"  [fail] {exp[\'id\']}: {ex}")
 
         del pipe
         if DEVICE.type == "cuda":
@@ -326,6 +364,34 @@ if not PNP_DIR.exists():
     )
 print("PnP at:", PNP_DIR, "exists:", PNP_DIR.exists())
 
+# Patch hardcoded model IDs in PnP scripts to a model that is still public
+# on HuggingFace. SD 2.1-base is gated and SD 1.5 (runwayml) was removed by
+# the publisher in 2024. SD 1.4 is structurally compatible and stays public.
+# We rewrite all three legacy IDs to the same SD 1.4 checkpoint.
+import re as _re
+_PUBLIC_SD = "CompVis/stable-diffusion-v1-4"
+_LEGACY = [
+    "stabilityai/stable-diffusion-2-1-base",
+    "stabilityai/stable-diffusion-2-base",
+    "runwayml/stable-diffusion-v1-5",
+]
+for _f in (PNP_DIR / "preprocess.py", PNP_DIR / "pnp.py"):
+    if _f.exists():
+        _src = _f.read_text()
+        for _legacy in _LEGACY:
+            _src = _src.replace(_legacy, _PUBLIC_SD)
+        # xformers is not installed on Colab; comment out the call.
+        _src = _src.replace(
+            "self.pipe.enable_xformers_memory_efficient_attention()",
+            "# self.pipe.enable_xformers_memory_efficient_attention()  # disabled (no xformers on Colab)",
+        )
+        _src = _src.replace(
+            "pipe.enable_xformers_memory_efficient_attention()",
+            "# pipe.enable_xformers_memory_efficient_attention()  # disabled (no xformers on Colab)",
+        )
+        _f.write_text(_src)
+        print("Patched", _f.name)
+
 # The repo ships its own requirements; we keep our pinned diffusers stack
 # and only add what PnP strictly needs beyond it.
 pip_install(["pyyaml>=6.0"])
@@ -345,6 +411,17 @@ try:
         latents_root = PNP_DIR / "latents_forward"
         latents_root.mkdir(exist_ok=True)
 
+        # Self-heal: rebuild TEST_IMAGES from disk if the test-images cell
+        # was not run in this session.
+        if "TEST_IMAGES" not in dir() and "TEST_IMAGES" not in globals():
+            TEST_IMAGES = {p.stem: p for p in TEST_DIR.glob("*.jpg")}
+        for required in ("portrait", "street", "indoor"):
+            if required not in TEST_IMAGES or not Path(TEST_IMAGES[required]).exists():
+                raise RuntimeError(
+                    f"Missing test image \'{required}\'. Run the Test Images cell "
+                    f"(section 2) first, or drop a {required}.jpg into {TEST_DIR}."
+                )
+
         for exp in PNP_EXPERIMENTS:
             try:
                 src_path = TEST_IMAGES[exp["source_image_key"]]
@@ -357,8 +434,9 @@ try:
                     [sys.executable, "preprocess.py",
                      "--data_path", str(local_src),
                      "--inversion_prompt", exp["source_prompt"],
-                     "--save_steps", "50",
-                     "--steps", "50"],
+                     "--save-steps", "50",
+                     "--steps", "50",
+                     "--sd_version", "1.5"],
                     cwd=str(PNP_DIR),
                     capture_output=True, text=True, timeout=900,
                 )
@@ -371,7 +449,11 @@ try:
                     "device": "cuda" if DEVICE.type == "cuda" else "cpu",
                     "output_path": str(out_dir / exp["id"]),
                     "image_path": str(local_src),
-                    "latents_path": str(latents_root / local_src.stem),
+                    # NB: pass the parent dir only. pnp.py internally appends
+                    # os.path.splitext(basename(image_path))[0] to this path,
+                    # so giving it the full stem-included path doubles it.
+                    "latents_path": str(latents_root),
+                    "sd_version": "1.5",
                     "prompt": exp["target_prompt"],
                     "negative_prompt": "ugly, blurry, low quality",
                     "guidance_scale": 7.5,
@@ -437,8 +519,54 @@ if not DRAGON_DIR.exists():
     )
 print("Dragon at:", DRAGON_DIR, "exists:", DRAGON_DIR.exists())
 
+# DragonDiffusion was written against diffusers ~0.16, before CrossAttention
+# was renamed to Attention. Rewrite the legacy imports to the new API so
+# the repo loads under our pinned diffusers 0.21.x.
+_DRAGON_PATCHES = [
+    # CrossAttention -> Attention (renamed in 0.18+).
+    ("from diffusers.models.cross_attention import CrossAttention",
+     "from diffusers.models.attention_processor import Attention as CrossAttention"),
+    ("from diffusers.models.cross_attention import",
+     "from diffusers.models.attention_processor import"),
+    ("diffusers.models.cross_attention.CrossAttention",
+     "diffusers.models.attention_processor.Attention"),
+    # UNet modules moved under diffusers.models.unets in 0.27+; the top-level
+    # re-export works on every diffusers version we care about.
+    ("from diffusers.models.unet_2d_condition import UNet2DConditionModel",
+     "from diffusers import UNet2DConditionModel"),
+    ("from diffusers.models.unet_2d_blocks import",
+     "from diffusers.models.unets.unet_2d_blocks import"),
+]
+_n_patched = 0
+for _f in DRAGON_DIR.rglob("*.py"):
+    _src = _f.read_text()
+    _new = _src
+    for _old, _repl in _DRAGON_PATCHES:
+        _new = _new.replace(_old, _repl)
+    if _new != _src:
+        _f.write_text(_new)
+        _n_patched += 1
+print(f"DragonDiffusion: patched {_n_patched} files for diffusers 0.21 compat")
+
 # Extra deps from DragonDiffusion that are not in our base stack.
-pip_install(["gradio==3.50.2", "basicsr==1.4.2", "einops==0.7.0"])
+# pytorch_lightning is also imported by Dragon\'s demo/model.py.
+pip_install(["gradio==3.50.2", "basicsr==1.4.2", "einops==0.7.0",
+             "pytorch_lightning==2.1.3"])
+
+# basicsr 1.4.x imports rgb_to_grayscale from torchvision\'s private path,
+# which was removed in torchvision 0.17. Patch the import in-place.
+import importlib.util as _ilu
+_basicsr_spec = _ilu.find_spec("basicsr.data.degradations")
+if _basicsr_spec and _basicsr_spec.origin:
+    _bf = Path(_basicsr_spec.origin)
+    _bs = _bf.read_text()
+    _bn = _bs.replace(
+        "from torchvision.transforms.functional_tensor import rgb_to_grayscale",
+        "from torchvision.transforms.functional import rgb_to_grayscale",
+    )
+    if _bn != _bs:
+        _bf.write_text(_bn)
+        print("Patched basicsr degradations.py for torchvision >=0.17")
 
 if str(DRAGON_DIR) not in sys.path:
     sys.path.insert(0, str(DRAGON_DIR))
@@ -452,7 +580,37 @@ try:
         import numpy as np
         from PIL import ImageDraw
 
+        # Stub xformers BEFORE importing DragonDiffusion. Dragon does a hard
+        # `import xformers`; we delegate memory_efficient_attention to torch
+        # SDPA so we don\'t need the real (Colab-incompatible) wheel.
+        if "xformers" not in sys.modules:
+            import types
+            import torch.nn.functional as _F
+            _xf     = types.ModuleType("xformers")
+            _xf_ops = types.ModuleType("xformers.ops")
+            def _mea(q, k, v, attn_bias=None, p=0.0, scale=None):
+                return _F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_bias, dropout_p=p, scale=scale,
+                )
+            _xf_ops.memory_efficient_attention = _mea
+            _xf_ops.MemoryEfficientAttentionFlashAttentionOp = None
+            _xf.ops = _xf_ops
+            sys.modules["xformers"] = _xf
+            sys.modules["xformers.ops"] = _xf_ops
+            print("xformers stubbed -> torch SDPA fallback")
+
         out_dir = RESULTS_DIR / "dragon"
+
+        # Self-heal: rebuild TEST_IMAGES from disk if the test-images cell
+        # was not run in this session.
+        if "TEST_IMAGES" not in dir() and "TEST_IMAGES" not in globals():
+            TEST_IMAGES = {p.stem: p for p in TEST_DIR.glob("*.jpg")}
+        for required in ("portrait", "street", "indoor"):
+            if required not in TEST_IMAGES or not Path(TEST_IMAGES[required]).exists():
+                raise RuntimeError(
+                    f"Missing test image \'{required}\'. Run the Test Images cell "
+                    f"(section 2) first, or drop a {required}.jpg into {TEST_DIR}."
+                )
 
         # Lazy import: DragonDiffusion has heavy side effects on import.
         try:
